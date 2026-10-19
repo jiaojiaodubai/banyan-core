@@ -1,0 +1,619 @@
+import { withDetail, } from "../messages.js";
+import { createSandboxApplicability, createSandboxResolver, createSandboxValidator, } from "./sandboxPredicate.js";
+/** Product boundary for `STYLE_OPTIONS` (see `dev/hostIntegration.md`). */
+const MAX_STYLE_OPTIONS = 16;
+const STYLE_OPTION_WARN_THRESHOLD = 12;
+const MAX_STATES = 20;
+/** Hostile declarations cannot make the normalizer walk an unbounded object. */
+const MAX_STATE_SCAN = 1_000;
+const MAX_PRESETS = 50;
+export function normalizeStyleParams(raw, context, messages) {
+    return normalizeParams(raw, context, "style", messages);
+}
+export function normalizeCitationParams(raw, context, messages) {
+    return normalizeParams(raw, context, "citation", messages);
+}
+export function normalizeCiteParams(raw, context, messages) {
+    return normalizeParams(raw, context, "cite", messages);
+}
+function normalizeParams(raw, context, scope, messages) {
+    if (!raw)
+        return undefined;
+    let exported;
+    try {
+        exported = context.exportValue(raw);
+    }
+    catch {
+        exported = raw;
+    }
+    const entries = Array.isArray(exported) ? exported : undefined;
+    const exportName = scopeName(scope);
+    const listMessages = withDetail(messages, {
+        declaration: { export: exportName },
+    });
+    if (!entries?.length) {
+        if (exported != null) {
+            warn(listMessages, `${exportName} must be a non-empty array; ignored`);
+        }
+        return undefined;
+    }
+    const out = [];
+    const seenIds = new Set();
+    for (const [index, entry] of entries.entries()) {
+        const entryMessages = withDetail(messages, {
+            declaration: { export: exportName, index },
+        });
+        const record = entry && typeof entry === "object" && !Array.isArray(entry)
+            ? entry
+            : null;
+        if (!record) {
+            warn(entryMessages, `skipped entry ${index}: not an object`);
+            continue;
+        }
+        const id = typeof record.id === "string" ? record.id.trim() : "";
+        const kind = typeof record.kind === "string" ? record.kind.trim() : "";
+        const paramMessages = id
+            ? withDetail(entryMessages, { declaration: { id } })
+            : entryMessages;
+        if (!id || !kind) {
+            warn(paramMessages, `skipped entry ${index}: missing ${!id ? "a non-empty string id" : "a non-empty string kind"}`);
+            continue;
+        }
+        if (isReservedKey(id)) {
+            warn(paramMessages, `'${id}': this key cannot be used as a parameter id; parameter skipped`);
+            continue;
+        }
+        if (seenIds.has(id)) {
+            warn(paramMessages, `'${id}': duplicate parameter id; parameter skipped`);
+            continue;
+        }
+        if (scope === "style" && out.length >= MAX_STYLE_OPTIONS) {
+            warn(paramMessages, `STYLE_OPTIONS exceeds ${MAX_STYLE_OPTIONS} entries; '${id}' and the rest were ignored`);
+            break;
+        }
+        if (kind === "list" && scope !== "cite") {
+            warn(paramMessages, `'${id}': list is only allowed in CITE_PARAMS`);
+            continue;
+        }
+        if (kind !== "state" && kind !== "value" && kind !== "list") {
+            warn(paramMessages, `'${id}': unsupported parameter kind '${kind}'; skipped`);
+            continue;
+        }
+        warnUnknownKeys(record, PARAM_KEYS[kind], `'${id}'`, paramMessages);
+        const base = {
+            id,
+            label: typeof record.label === "string" && record.label.trim()
+                ? record.label.trim()
+                : id,
+            ...(typeof record.description === "string" && record.description.trim()
+                ? { description: record.description.trim() }
+                : {}),
+        };
+        let param;
+        if (kind === "state") {
+            param = normalizeState(base, record, context, paramMessages);
+        }
+        else if (kind === "value") {
+            param = normalizeValue(base, record, context, paramMessages);
+        }
+        else {
+            param = normalizeList(base, record, context, paramMessages);
+        }
+        if (!param)
+            continue;
+        if (scope !== "style") {
+            const applicable = normalizeApplicable(record.applicable, context, paramMessages, id);
+            if (applicable) {
+                Object.assign(param, { applicable });
+            }
+        }
+        else if (record.applicable !== undefined) {
+            warn(paramMessages, `'${id}': applicable is not supported for STYLE_OPTIONS; ignored`);
+        }
+        out.push(param);
+        seenIds.add(id);
+    }
+    if (!out.length)
+        return undefined;
+    if (scope === "style" && out.length >= STYLE_OPTION_WARN_THRESHOLD) {
+        warn(listMessages, `STYLE_OPTIONS declares ${out.length} options; consider splitting the style or moving per-citation differences into params`);
+    }
+    return out;
+}
+function normalizeState(base, record, context, messages) {
+    const rawStates = record.states;
+    let states;
+    if (rawStates !== undefined) {
+        const preferred = new Set();
+        // State keys are trimmed by `normalizeStates`, so the values that must
+        // survive the cap are compared in the same form; otherwise `" foo "` would
+        // fail to protect `foo` and the default could silently re-point.
+        if (typeof record.defaultValue === "string") {
+            preferred.add(record.defaultValue.trim());
+        }
+        if (typeof record.forcedValue === "string") {
+            preferred.add(record.forcedValue.trim());
+        }
+        states = normalizeStates(base.id, rawStates, messages, preferred);
+        if (!states) {
+            warn(messages, `'${base.id}': states must be a non-empty object; treating as boolean state`);
+        }
+    }
+    if (record.validate !== undefined) {
+        warn(messages, `'${base.id}': validate is not available on state parameters; ignored`);
+    }
+    let defaultValue;
+    if (states) {
+        const rawDefault = typeof record.defaultValue === "string"
+            ? record.defaultValue.trim()
+            : record.defaultValue;
+        if (typeof rawDefault !== "string" || !Object.hasOwn(states, rawDefault)) {
+            if (rawDefault !== undefined) {
+                warn(messages, `'${base.id}': defaultValue must be one of states; using the first state`);
+            }
+            defaultValue = Object.keys(states)[0];
+        }
+        else {
+            defaultValue = rawDefault;
+        }
+    }
+    else {
+        const rawDefault = record.defaultValue;
+        if (rawDefault === undefined) {
+            defaultValue = false;
+        }
+        else if (typeof rawDefault === "boolean") {
+            defaultValue = rawDefault;
+        }
+        else {
+            warn(messages, `'${base.id}': boolean state defaultValue must be boolean; using false`);
+            defaultValue = false;
+        }
+    }
+    const forcedValue = normalizeForced(base.id, record.forcedValue, "state", context, messages, states);
+    return {
+        ...base,
+        kind: "state",
+        ...(states ? { states } : {}),
+        defaultValue,
+        ...(forcedValue === undefined ? {} : { forcedValue }),
+    };
+}
+function normalizeValue(base, record, context, messages) {
+    const defaultValue = normalizeStringDefault(base.id, record.defaultValue, messages);
+    const presets = normalizePresets(base.id, record.presets, messages);
+    const format = normalizeFormat(base.id, record.format, messages);
+    const forcedValue = normalizeForced(base.id, record.forcedValue, "value", context, messages);
+    const validate = normalizeValidate(base.id, record.validate, context, messages);
+    return {
+        ...base,
+        kind: "value",
+        defaultValue,
+        ...(presets ? { presets } : {}),
+        ...(format ? { format } : {}),
+        ...(forcedValue === undefined ? {} : { forcedValue }),
+        ...(validate ? { validate } : {}),
+    };
+}
+function normalizeList(base, record, context, messages) {
+    const rawFields = record.fields;
+    if (!Array.isArray(rawFields) || !rawFields.length) {
+        warn(messages, `'${base.id}': list needs a non-empty fields array; skipped`);
+        return undefined;
+    }
+    if (record.validate !== undefined) {
+        warn(messages, `'${base.id}': validate is not available on list parameters; ignored`);
+    }
+    const fields = [];
+    const fieldIds = new Set();
+    for (const [index, entry] of rawFields.entries()) {
+        const fieldIndexMessages = withDetail(messages, {
+            declaration: { fieldIndex: index },
+        });
+        const field = entry && typeof entry === "object" && !Array.isArray(entry)
+            ? entry
+            : null;
+        if (!field) {
+            warn(fieldIndexMessages, `'${base.id}'.fields[${index}]: not an object; field skipped`);
+            continue;
+        }
+        const fieldId = typeof field.id === "string" ? field.id.trim() : "";
+        const fieldKind = typeof field.kind === "string" ? field.kind.trim() : "";
+        const fieldMessages = fieldId
+            ? withDetail(fieldIndexMessages, { declaration: { field: fieldId } })
+            : fieldIndexMessages;
+        if (!fieldId || fieldKind !== "value") {
+            warn(fieldMessages, `'${base.id}'.fields[${index}]: list fields must be value parameters with an id; field skipped`);
+            continue;
+        }
+        if (isReservedKey(fieldId)) {
+            warn(fieldMessages, `'${base.id}'.fields[${index}]: this key cannot be used as a field id; field skipped`);
+            continue;
+        }
+        if (fieldIds.has(fieldId)) {
+            warn(fieldMessages, `'${base.id}'.fields: duplicate field id '${fieldId}'; field skipped`);
+            continue;
+        }
+        if (field.applicable !== undefined || field.forcedValue !== undefined) {
+            warn(fieldMessages, `'${base.id}'.${fieldId}: applicable/forcedValue are not available inside a list; ignored`);
+        }
+        warnUnknownKeys(field, LIST_FIELD_KEYS, `'${base.id}.${fieldId}'`, fieldMessages);
+        const normalized = normalizeListField(fieldId, field, context, fieldMessages);
+        if (!normalized)
+            continue;
+        fields.push(normalized);
+        fieldIds.add(fieldId);
+    }
+    if (!fields.length)
+        return undefined;
+    let min = normalizeBound(record.min);
+    let max = normalizeBound(record.max);
+    if (record.min !== undefined && min === undefined) {
+        warn(messages, `'${base.id}': min must be a non-negative number; ignored`);
+    }
+    if (record.max !== undefined && max === undefined) {
+        warn(messages, `'${base.id}': max must be a non-negative number; ignored`);
+    }
+    if (min !== undefined && max !== undefined && min > max) {
+        warn(messages, `'${base.id}': min ${min} is greater than max ${max}; bounds ignored`);
+        min = undefined;
+        max = undefined;
+    }
+    const defaultValue = normalizeRows(base.id, record.defaultValue, fields, messages, "defaultValue");
+    let forcedValue;
+    if (record.forcedValue !== undefined) {
+        if (typeof record.forcedValue === "function") {
+            forcedValue = createSandboxResolver(record.forcedValue, context);
+            if (!forcedValue) {
+                warn(messages, `'${base.id}': forcedValue must be a function or value; ignored`);
+            }
+        }
+        else {
+            const rows = normalizeRows(base.id, record.forcedValue, fields, messages, "forcedValue", false);
+            if (rows) {
+                forcedValue = rows;
+            }
+        }
+    }
+    const defaultRows = defaultValue ?? [];
+    warnRowBounds(base.id, "defaultValue", defaultRows, min, max, messages);
+    if (Array.isArray(forcedValue)) {
+        warnRowBounds(base.id, "forcedValue", forcedValue, min, max, messages);
+    }
+    return {
+        ...base,
+        kind: "list",
+        fields,
+        ...(min === undefined ? {} : { min }),
+        ...(max === undefined ? {} : { max }),
+        defaultValue: defaultRows,
+        ...(forcedValue === undefined ? {} : { forcedValue }),
+    };
+}
+/** Bounds are editor policy, but a declared default/forced row set can be
+ * checked now; the core still never truncates caller data at resolution time. */
+function warnRowBounds(id, label, rows, min, max, messages) {
+    if (min !== undefined && rows.length < min) {
+        warn(messages, `'${id}': ${label} has ${rows.length} row${rows.length === 1 ? "" : "s"}, below min ${min}`);
+    }
+    if (max !== undefined && rows.length > max) {
+        warn(messages, `'${id}': ${label} has ${rows.length} row${rows.length === 1 ? "" : "s"}, above max ${max}`);
+    }
+}
+function normalizeListField(id, record, context, messages) {
+    const label = typeof record.label === "string" && record.label.trim()
+        ? record.label.trim()
+        : id;
+    const description = typeof record.description === "string" && record.description.trim()
+        ? record.description.trim()
+        : undefined;
+    const defaultValue = normalizeStringDefault(id, record.defaultValue, messages);
+    const presets = normalizePresets(id, record.presets, messages);
+    const format = normalizeFormat(id, record.format, messages);
+    const validate = normalizeValidate(id, record.validate, context, messages);
+    return {
+        id,
+        kind: "value",
+        label,
+        ...(description ? { description } : {}),
+        defaultValue,
+        ...(presets ? { presets } : {}),
+        ...(format ? { format } : {}),
+        ...(validate ? { validate } : {}),
+    };
+}
+function normalizeApplicable(raw, context, messages, id) {
+    if (raw === undefined)
+        return undefined;
+    const predicate = createSandboxApplicability(raw, context);
+    if (!predicate) {
+        warn(messages, `'${id}': applicable must be a function; ignored`);
+    }
+    return predicate;
+}
+function normalizeForced(id, raw, kind, context, messages, states) {
+    if (raw === undefined)
+        return undefined;
+    if (typeof raw === "function") {
+        const resolver = createSandboxResolver(raw, context);
+        if (!resolver) {
+            warn(messages, `'${id}': forcedValue must be a function or value; ignored`);
+        }
+        return resolver;
+    }
+    if (kind === "state") {
+        if (states) {
+            const key = typeof raw === "string" ? raw.trim() : undefined;
+            if (key && Object.hasOwn(states, key))
+                return key;
+            warn(messages, `'${id}': forcedValue must be one of states; ignored`);
+            return undefined;
+        }
+        if (typeof raw === "boolean")
+            return raw;
+        warn(messages, `'${id}': boolean state forcedValue must be boolean; ignored`);
+        return undefined;
+    }
+    if (typeof raw === "string")
+        return raw;
+    warn(messages, `'${id}': value forcedValue must be a string; ignored`);
+    return undefined;
+}
+function normalizeValidate(id, raw, context, messages) {
+    if (raw === undefined)
+        return undefined;
+    const validator = createSandboxValidator(raw, context);
+    if (!validator) {
+        warn(messages, `'${id}': validate must be a function; ignored`);
+    }
+    // The public declaration keeps the author contract (`ParamCheckResult`); the
+    // bridge itself returns the raw value so `runValidation` can see a thenable.
+    // Hosts read `states[id].validation` instead of calling this.
+    return validator;
+}
+function normalizeStates(id, raw, messages, preferred) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw))
+        return undefined;
+    const record = raw;
+    const entries = [];
+    let scanned = 0;
+    for (const key in record) {
+        if (!Object.hasOwn(record, key))
+            continue;
+        if (scanned >= MAX_STATE_SCAN) {
+            warn(messages, `'${id}': states are scanned up to ${MAX_STATE_SCAN} entries; the rest were ignored`);
+            break;
+        }
+        scanned += 1;
+        const label = record[key];
+        const trimmed = key.trim();
+        if (!trimmed || isReservedKey(trimmed)) {
+            warn(messages, `'${id}': state key '${trimmed || key}' cannot be used; state skipped`);
+            continue;
+        }
+        if (typeof label !== "string") {
+            warn(messages, `'${id}': label of state '${trimmed}' coerced from ${typeof label} to string`);
+        }
+        entries.push({ key: trimmed, label: String(label ?? "") });
+    }
+    if (!entries.length)
+        return undefined;
+    let kept = entries;
+    if (entries.length > MAX_STATES) {
+        // A declared default or static forced value must stay selectable even when
+        // it sits beyond the cap; otherwise truncation would silently re-point the
+        // parameter at a different state.
+        const protectedEntries = entries.filter((entry) => preferred.has(entry.key));
+        const ordinary = entries.filter((entry) => !preferred.has(entry.key));
+        const room = Math.max(0, MAX_STATES - protectedEntries.length);
+        const keptKeys = new Set([
+            ...protectedEntries.slice(0, MAX_STATES).map((entry) => entry.key),
+            ...ordinary.slice(0, room).map((entry) => entry.key),
+        ]);
+        kept = entries.filter((entry) => keptKeys.has(entry.key));
+        const dropped = entries
+            .filter((entry) => !keptKeys.has(entry.key))
+            .map((entry) => entry.key);
+        const listed = dropped.slice(0, 10).join(", ");
+        const rest = dropped.length > 10 ? `, +${dropped.length - 10} more` : "";
+        warn(messages, `'${id}': states are capped at ${MAX_STATES}; dropped: ${listed}${rest}`);
+    }
+    return Object.fromEntries(kept.map((entry) => [entry.key, entry.label]));
+}
+function normalizePresets(id, raw, messages) {
+    if (raw === undefined)
+        return undefined;
+    if (!Array.isArray(raw)) {
+        warn(messages, `'${id}': presets must be an array; ignored`);
+        return undefined;
+    }
+    const out = [];
+    const seen = new Set();
+    let truncated = false;
+    for (const entry of raw) {
+        let value;
+        let label;
+        if (typeof entry === "string") {
+            value = entry.trim();
+            label = value;
+        }
+        else if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+            const object = entry;
+            value = typeof object.value === "string" ? object.value.trim() : "";
+            if (typeof object.label === "string" && object.label.trim()) {
+                label = object.label.trim();
+            }
+            else {
+                label = value;
+                if (object.label !== undefined) {
+                    warn(messages, `'${id}': label of preset '${value}' must be a non-empty string; using the value`);
+                }
+            }
+        }
+        else {
+            warn(messages, `'${id}': preset entry is not a string or object; skipped`);
+            continue;
+        }
+        if (!value) {
+            warn(messages, `'${id}': preset without a value; skipped`);
+            continue;
+        }
+        if (seen.has(value)) {
+            warn(messages, `'${id}': duplicate preset value '${value}'; skipped`);
+            continue;
+        }
+        if (out.length >= MAX_PRESETS) {
+            truncated = true;
+            break;
+        }
+        seen.add(value);
+        out.push({ label, value });
+    }
+    if (truncated) {
+        warn(messages, `'${id}': presets are capped at ${MAX_PRESETS}; later entries were ignored`);
+    }
+    return out.length ? out : undefined;
+}
+function normalizeFormat(id, raw, messages) {
+    if (raw === undefined || raw === "plain")
+        return undefined;
+    if (raw === "rich")
+        return "rich";
+    warn(messages, `'${id}': format must be "plain" or "rich"; using plain`);
+    return undefined;
+}
+function normalizeStringDefault(id, raw, messages) {
+    if (raw === undefined)
+        return "";
+    if (typeof raw === "string")
+        return raw;
+    if (typeof raw === "number" || typeof raw === "boolean") {
+        warn(messages, `'${id}': defaultValue coerced from ${typeof raw} to string`);
+        return String(raw);
+    }
+    warn(messages, `'${id}': defaultValue must be a string; using ""`);
+    return "";
+}
+function normalizeRows(id, raw, fields, messages, source, fallbackToEmpty = true) {
+    if (raw === undefined)
+        return fallbackToEmpty ? [] : undefined;
+    if (!Array.isArray(raw)) {
+        warn(messages, `'${id}': ${source} must be an array of rows; ignored`);
+        return fallbackToEmpty ? [] : undefined;
+    }
+    const rows = [];
+    for (const [index, entry] of raw.entries()) {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+            warn(messages, `'${id}'.${source}[${index}]: not a row; skipped`);
+            continue;
+        }
+        const record = entry;
+        const fieldIds = new Set(fields.map((field) => field.id));
+        for (const key of Object.keys(record)) {
+            if (!fieldIds.has(key)) {
+                warn(messages, `'${id}'.${source}[${index}]: unknown field '${key}' is ignored`);
+            }
+        }
+        const row = {};
+        for (const field of fields) {
+            const value = record[field.id];
+            if (value !== undefined && typeof value !== "string") {
+                warn(messages, `'${id}'.${source}[${index}].${field.id} must be a string; using the field default`);
+            }
+            row[field.id] = typeof value === "string" ? value : field.defaultValue;
+        }
+        rows.push(row);
+    }
+    // An empty array supplied by the author is meaningful (an explicitly forced
+    // empty list). A non-empty array whose every row was dropped is not: keeping
+    // the resulting [] would silently turn malformed input into a lock. The
+    // caller sees undefined, the same outcome as a non-array or rejected
+    // resolver.
+    if (!rows.length && raw.length > 0 && !fallbackToEmpty) {
+        return undefined;
+    }
+    return rows;
+}
+function isReservedKey(value) {
+    return value === "__proto__";
+}
+const PARAM_KEYS = {
+    state: new Set([
+        "id",
+        "kind",
+        "label",
+        "description",
+        "states",
+        "defaultValue",
+        "forcedValue",
+        "validate",
+        "applicable",
+    ]),
+    value: new Set([
+        "id",
+        "kind",
+        "label",
+        "description",
+        "defaultValue",
+        "presets",
+        "format",
+        "forcedValue",
+        "validate",
+        "applicable",
+    ]),
+    list: new Set([
+        "id",
+        "kind",
+        "label",
+        "description",
+        "fields",
+        "min",
+        "max",
+        "defaultValue",
+        "forcedValue",
+        "validate",
+        "applicable",
+    ]),
+};
+const LIST_FIELD_KEYS = new Set([
+    "id",
+    "kind",
+    "label",
+    "description",
+    "defaultValue",
+    "presets",
+    "format",
+    "validate",
+    "applicable",
+    "forcedValue",
+]);
+function warnUnknownKeys(record, allowed, path, messages) {
+    for (const key of Object.keys(record)) {
+        if (!allowed.has(key)) {
+            warn(messages, `${path}: unknown key '${key}' is ignored`);
+        }
+    }
+}
+function normalizeBound(value) {
+    return typeof value === "number" && Number.isFinite(value) && value >= 0
+        ? Math.floor(value)
+        : undefined;
+}
+function scopeName(scope) {
+    switch (scope) {
+        case "style":
+            return "STYLE_OPTIONS";
+        case "citation":
+            return "CITATION_PARAMS";
+        case "cite":
+            return "CITE_PARAMS";
+    }
+}
+function warn(messages, message) {
+    messages.report({
+        severity: "warning",
+        source: "params",
+        message,
+    });
+}
+//# sourceMappingURL=params.js.map
